@@ -1,0 +1,281 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: emudhra-ca-certificates-patcher
+  namespace: kube-system
+  labels:
+    app.kubernetes.io/name: emudhra-ca-certificates-patcher
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: emudhra-ca-certificates-patcher
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: emudhra-ca-certificates-patcher
+    spec:
+      automountServiceAccountToken: false
+      hostNetwork: true
+      hostPID: true
+      nodeSelector:
+        kubernetes.io/os: linux
+      tolerations:
+        - operator: Exists
+      containers:
+        - name: patcher
+          # Pin the multi-architecture image index so a compromised TLS trust
+          # store cannot be used to substitute different image content.
+          image: ubuntu:24.04@sha256:68ee22004a9109b44973313b02ff7b1de250f1de0f5ecb628d73f579aaff33ac
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            privileged: true
+            runAsUser: 0
+            runAsGroup: 0
+            allowPrivilegeEscalation: true
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          env:
+            # Set to "false" before applying the manifest to skip the restart.
+            - name: RESTART_CONTAINERD
+              value: "true"
+          readinessProbe:
+            exec:
+              command:
+                - test
+                - -f
+                - /tmp/upgrade-complete
+            periodSeconds: 5
+          volumeMounts:
+            - name: host-root
+              mountPath: /host
+              mountPropagation: HostToContainer
+          command:
+            - /bin/bash
+            - -c
+            - |
+              set -Eeuo pipefail
+
+              readonly containerd_restart_marker="/host/var/lib/emudhra-ca-certificates-patcher/containerd-restart-required"
+
+              complete() {
+                touch /tmp/upgrade-complete
+                exec sleep infinity
+              }
+
+              verify_compromised_certificates_are_rejected() {
+                local url
+                local output
+                local exit_code
+                local urls=(
+                  "https://dv-g3b-emudhra.we-have-a-problem.com/"
+                  "https://dv-g3b-aaa-emudhra.we-have-a-problem.com/"
+                )
+
+                if ! chroot /host /bin/sh -c 'command -v curl >/dev/null 2>&1'; then
+                  echo "Cannot verify the trust store because curl is not installed on the host"
+                  return 1
+                fi
+
+                for url in "${urls[@]}"; do
+                  set +e
+                  output="$(chroot /host curl \
+                    --silent \
+                    --show-error \
+                    --output /dev/null \
+                    --connect-timeout 10 \
+                    --max-time 30 \
+                    --proto '=https' \
+                    "$url" 2>&1)"
+                  exit_code=$?
+                  set -e
+
+                  case "$exit_code" in
+                    60)
+                      echo "Verified that the host trust store rejects $url"
+                      ;;
+                    0)
+                      echo "The host still trusts the compromised certificate served by $url"
+                      return 1
+                      ;;
+                    *)
+                      echo "Could not verify $url: curl exited with code $exit_code: $output"
+                      return 1
+                      ;;
+                  esac
+                done
+              }
+
+              host_systemctl() {
+                # Enter PID 1's mount and PID namespaces and adopt its root so
+                # both systemctl and the systemd bus resolve from the host.
+                nsenter --target 1 --mount --pid --root -- systemctl "$@"
+              }
+
+              wait_for_containerd() {
+                local deadline=$((SECONDS + 60))
+                local stable_checks=0
+
+                while (( SECONDS < deadline )); do
+                  if host_systemctl is-active --quiet containerd; then
+                    ((stable_checks += 1))
+                    if (( stable_checks >= 6 )); then
+                      return 0
+                    fi
+                  else
+                    stable_checks=0
+                  fi
+                  sleep 2
+                done
+
+                return 1
+              }
+
+              restart_containerd_if_enabled() {
+                local attempt
+                local max_attempts=3
+
+                case "${RESTART_CONTAINERD,,}" in
+                  true|1|yes)
+                    for ((attempt = 1; attempt <= max_attempts; attempt++)); do
+                      echo "Restarting containerd (attempt ${attempt}/${max_attempts})"
+                      if host_systemctl restart containerd; then
+                        if wait_for_containerd; then
+                          rm -f "$containerd_restart_marker"
+                          echo "Successfully restarted containerd; it remained active for at least 10 seconds"
+                          return 0
+                        fi
+                        echo "containerd did not become stable within 60 seconds on attempt ${attempt}"
+                      else
+                        echo "systemctl restart containerd failed on attempt ${attempt}; keeping the restart marker"
+                      fi
+
+                      if (( attempt < max_attempts )); then
+                        sleep 5
+                      fi
+                    done
+
+                    echo "containerd failed to restart after ${max_attempts} attempts"
+                    host_systemctl status --no-pager containerd || true
+                    return 1
+                    ;;
+                  false|0|no)
+                    rm -f "$containerd_restart_marker"
+                    echo "Skipping containerd restart because RESTART_CONTAINERD=${RESTART_CONTAINERD}"
+                    ;;
+                  *)
+                    echo "Invalid RESTART_CONTAINERD value ${RESTART_CONTAINERD}; expected true or false"
+                    return 1
+                    ;;
+                esac
+              }
+
+              if [[ ! -r /host/etc/os-release ]]; then
+                echo "Cannot identify the host OS; /etc/os-release is missing"
+                exit 1
+              fi
+
+              # The file belongs to the trusted host and provides ID and VERSION_ID.
+              source /host/etc/os-release
+              if [[ "${ID:-}" != "ubuntu" ]]; then
+                echo "Skipping non-Ubuntu node (${PRETTY_NAME:-unknown OS})"
+                complete
+              fi
+
+              # Minimum versions containing the eMudhra distrust updates from
+              # USN-8944-1 (ca-certificates) and USN-8947-1 (libnss3).
+              case "${VERSION_ID:-}" in
+                22.04)
+                  minimum_ca_certificates_version="20260816ubuntu0.22.04.1"
+                  minimum_libnss3_version="2:3.98-0ubuntu0.22.04.5"
+                  ;;
+                24.04)
+                  minimum_ca_certificates_version="20260816ubuntu0.24.04.1"
+                  minimum_libnss3_version="2:3.98-1ubuntu0.3"
+                  ;;
+                *)
+                  echo "Skipping unsupported Ubuntu release ${VERSION_ID:-unknown}"
+                  complete
+                  ;;
+              esac
+
+              current_ca_certificates_version="$(chroot /host dpkg-query --show --showformat='${Version}' ca-certificates 2>/dev/null || true)"
+              current_libnss3_version="$(chroot /host dpkg-query --show --showformat='${Version}' libnss3 2>/dev/null || true)"
+              packages_to_upgrade=()
+              ca_certificates_upgrade_required=false
+
+              if [[ -n "$current_ca_certificates_version" ]] && \
+                chroot /host dpkg --compare-versions "$current_ca_certificates_version" ge "$minimum_ca_certificates_version"; then
+                echo "ca-certificates ${current_ca_certificates_version} satisfies minimum ${minimum_ca_certificates_version}"
+              else
+                echo "ca-certificates ${current_ca_certificates_version:-not installed} is below minimum ${minimum_ca_certificates_version}"
+                packages_to_upgrade+=(ca-certificates)
+                ca_certificates_upgrade_required=true
+              fi
+
+              if [[ -n "$current_libnss3_version" ]] && \
+                chroot /host dpkg --compare-versions "$current_libnss3_version" ge "$minimum_libnss3_version"; then
+                echo "libnss3 ${current_libnss3_version} satisfies minimum ${minimum_libnss3_version}"
+              else
+                echo "libnss3 ${current_libnss3_version:-not installed} is below minimum ${minimum_libnss3_version}"
+                packages_to_upgrade+=(libnss3)
+              fi
+
+              if (( ${#packages_to_upgrade[@]} == 0 )); then
+                verify_compromised_certificates_are_rejected
+                if [[ -f "$containerd_restart_marker" ]]; then
+                  echo "A previous ca-certificates update still requires a successful containerd restart"
+                  restart_containerd_if_enabled
+                else
+                  echo "All required packages were already current; containerd restart is not needed"
+                fi
+                complete
+              fi
+
+              echo "Upgrading only outdated packages: ${packages_to_upgrade[*]}"
+              chroot /host /usr/bin/env DEBIAN_FRONTEND=noninteractive \
+                apt-get \
+                -o Acquire::Retries=5 \
+                -o DPkg::Lock::Timeout=300 \
+                update
+              if [[ "$ca_certificates_upgrade_required" == "true" ]]; then
+                mkdir -p "$(dirname "$containerd_restart_marker")"
+                touch "$containerd_restart_marker"
+              fi
+              chroot /host /usr/bin/env DEBIAN_FRONTEND=noninteractive \
+                apt-get \
+                --assume-yes \
+                --no-install-recommends \
+                -o Acquire::Retries=5 \
+                -o DPkg::Lock::Timeout=300 \
+                install "${packages_to_upgrade[@]}"
+
+              installed_ca_certificates_version="$(chroot /host dpkg-query --show --showformat='${Version}' ca-certificates)"
+              installed_libnss3_version="$(chroot /host dpkg-query --show --showformat='${Version}' libnss3)"
+              if ! chroot /host dpkg --compare-versions "$installed_ca_certificates_version" ge "$minimum_ca_certificates_version"; then
+                echo "Installed ca-certificates ${installed_ca_certificates_version} is below required minimum ${minimum_ca_certificates_version}"
+                exit 1
+              fi
+              if ! chroot /host dpkg --compare-versions "$installed_libnss3_version" ge "$minimum_libnss3_version"; then
+                echo "Installed libnss3 ${installed_libnss3_version} is below required minimum ${minimum_libnss3_version}"
+                exit 1
+              fi
+
+              verify_compromised_certificates_are_rejected
+              if [[ -f "$containerd_restart_marker" ]]; then
+                restart_containerd_if_enabled
+              else
+                echo "Only libnss3 was upgraded; containerd does not use NSS, so no restart is needed"
+              fi
+              echo "Successfully verified ca-certificates ${installed_ca_certificates_version} and libnss3 ${installed_libnss3_version}"
+              complete
+      terminationGracePeriodSeconds: 5
+      volumes:
+        - name: host-root
+          hostPath:
+            path: /
+            type: Directory

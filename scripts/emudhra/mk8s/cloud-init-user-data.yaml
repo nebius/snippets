@@ -1,0 +1,211 @@
+#cloud-config
+write_files:
+  - path: /usr/local/sbin/emudhra-ca-certificates-patcher
+    owner: root:root
+    permissions: "0755"
+    content: |
+      #!/usr/bin/env bash
+      set -uo pipefail
+
+      readonly log_file="/var/log/emudhra-ca-certificates-patcher.log"
+      readonly status_dir="/var/lib/emudhra-ca-certificates-patcher"
+      readonly status_file="${status_dir}/status"
+      readonly tag="emudhra-ca-certificates-patcher"
+      readonly urls=(
+        "https://dv-g3b-emudhra.we-have-a-problem.com/"
+        "https://dv-g3b-aaa-emudhra.we-have-a-problem.com/"
+      )
+
+      mkdir -p "$status_dir"
+      touch "$log_file"
+      exec > >(tee -a "$log_file") 2>&1
+
+      log() {
+        local message="[$(date --utc +%Y-%m-%dT%H:%M:%SZ)] $*"
+        echo "$message"
+        logger --tag "$tag" -- "$message" 2>/dev/null || true
+      }
+
+      package_version() {
+        dpkg-query --show --showformat='${Version}' "$1" 2>/dev/null || echo "not-installed"
+      }
+
+      # Minimum versions containing the eMudhra distrust updates from
+      # USN-8944-1 (ca-certificates) and USN-8947-1 (libnss3).
+      minimum_ca_certificates_version=""
+      minimum_libnss3_version=""
+      if [[ -r /etc/os-release ]]; then
+        source /etc/os-release
+        case "${VERSION_ID:-}" in
+          22.04)
+            minimum_ca_certificates_version="20260816ubuntu0.22.04.1"
+            minimum_libnss3_version="2:3.98-0ubuntu0.22.04.5"
+            ;;
+          24.04)
+            minimum_ca_certificates_version="20260816ubuntu0.24.04.1"
+            minimum_libnss3_version="2:3.98-1ubuntu0.3"
+            ;;
+        esac
+      fi
+
+      previous_ca_certificates_version="$(package_version ca-certificates)"
+      previous_libnss3_version="$(package_version libnss3)"
+      update_status="failure"
+      trust_store_version_status="failure"
+      verification_status="failure"
+      containerd_restart_status="failure"
+      endpoint_emudhra="not-checked"
+      endpoint_aaa_emudhra="not-checked"
+      packages_to_upgrade=()
+      rebuild_system_store=false
+
+      log "Starting eMudhra trust-store patch; ca-certificates=${previous_ca_certificates_version} libnss3=${previous_libnss3_version}"
+
+      if [[ -n "$minimum_ca_certificates_version" && -n "$minimum_libnss3_version" ]]; then
+        if [[ "$previous_ca_certificates_version" != "not-installed" ]] && \
+          dpkg --compare-versions "$previous_ca_certificates_version" ge "$minimum_ca_certificates_version"; then
+          log "ca-certificates ${previous_ca_certificates_version} already satisfies minimum ${minimum_ca_certificates_version}"
+        else
+          packages_to_upgrade+=(ca-certificates)
+          rebuild_system_store=true
+        fi
+
+        if [[ "$previous_libnss3_version" != "not-installed" ]] && \
+          dpkg --compare-versions "$previous_libnss3_version" ge "$minimum_libnss3_version"; then
+          log "libnss3 ${previous_libnss3_version} already satisfies minimum ${minimum_libnss3_version}"
+        else
+          packages_to_upgrade+=(libnss3)
+        fi
+      fi
+
+      if [[ -z "$minimum_ca_certificates_version" || -z "$minimum_libnss3_version" ]]; then
+        log "ERROR: no minimum trust-store package versions are defined for Ubuntu ${VERSION_ID:-unknown}"
+      elif (( ${#packages_to_upgrade[@]} == 0 )); then
+        update_status="not-needed"
+        log "All trust-store packages already satisfy their minimum versions; skipping APT"
+      elif ! command -v apt-get >/dev/null 2>&1; then
+        log "ERROR: apt-get is unavailable; trust-store packages were not updated"
+      elif DEBIAN_FRONTEND=noninteractive apt-get \
+        -o Acquire::Retries=5 \
+        -o DPkg::Lock::Timeout=300 \
+        update && \
+        DEBIAN_FRONTEND=noninteractive apt-get \
+        --assume-yes \
+        --no-install-recommends \
+        -o Acquire::Retries=5 \
+        -o DPkg::Lock::Timeout=300 \
+        install "${packages_to_upgrade[@]}"; then
+        update_status="success"
+        log "Successfully updated only outdated packages: ${packages_to_upgrade[*]}"
+        if [[ "$rebuild_system_store" == "true" ]] && ! update-ca-certificates --fresh; then
+          update_status="failure"
+          log "ERROR: packages were updated, but rebuilding the system CA trust store failed"
+        fi
+      else
+        log "ERROR: failed to update outdated packages: ${packages_to_upgrade[*]}"
+      fi
+
+      installed_ca_certificates_version="$(package_version ca-certificates)"
+      installed_libnss3_version="$(package_version libnss3)"
+      log "Installed versions after the update attempt: ca-certificates=${installed_ca_certificates_version} libnss3=${installed_libnss3_version}"
+
+      log "Restarting containerd once so it reloads the current system CA store"
+      if systemctl restart containerd; then
+        containerd_restart_status="success"
+        log "Successfully restarted containerd"
+      else
+        log "ERROR: failed to restart containerd; continuing without retry"
+      fi
+
+      if [[ -n "$minimum_ca_certificates_version" && -n "$minimum_libnss3_version" ]]; then
+        ca_certificates_current=false
+        libnss3_current=false
+        if [[ "$installed_ca_certificates_version" != "not-installed" ]] && \
+          dpkg --compare-versions "$installed_ca_certificates_version" ge "$minimum_ca_certificates_version"; then
+          ca_certificates_current=true
+        else
+          log "ERROR: ca-certificates ${installed_ca_certificates_version} is below required minimum ${minimum_ca_certificates_version}"
+        fi
+        if [[ "$installed_libnss3_version" != "not-installed" ]] && \
+          dpkg --compare-versions "$installed_libnss3_version" ge "$minimum_libnss3_version"; then
+          libnss3_current=true
+        else
+          log "ERROR: libnss3 ${installed_libnss3_version} is below required minimum ${minimum_libnss3_version}"
+        fi
+        if [[ "$ca_certificates_current" == "true" && "$libnss3_current" == "true" ]]; then
+          trust_store_version_status="success"
+          log "Both trust-store packages contain the required eMudhra mitigations"
+        fi
+      fi
+
+      verification_ok=true
+      if ! command -v curl >/dev/null 2>&1; then
+        log "ERROR: curl is unavailable; the updated trust store cannot be verified"
+        verification_ok=false
+      else
+        for index in "${!urls[@]}"; do
+          url="${urls[$index]}"
+          output="$(curl \
+            --silent \
+            --show-error \
+            --output /dev/null \
+            --connect-timeout 10 \
+            --max-time 30 \
+            --proto '=https' \
+            "$url" 2>&1)"
+          exit_code=$?
+
+          case "$exit_code" in
+            60)
+              endpoint_status="rejected"
+              log "SUCCESS: the host trust store rejects the compromised chain at ${url}"
+              ;;
+            0)
+              endpoint_status="trusted"
+              verification_ok=false
+              log "ERROR: the host still trusts the compromised chain at ${url}"
+              ;;
+            *)
+              endpoint_status="indeterminate-curl-exit-${exit_code}"
+              verification_ok=false
+              log "ERROR: could not verify ${url}; curl exited with ${exit_code}: ${output}"
+              ;;
+          esac
+
+          if [[ "$index" == "0" ]]; then
+            endpoint_emudhra="$endpoint_status"
+          else
+            endpoint_aaa_emudhra="$endpoint_status"
+          fi
+        done
+      fi
+
+      if [[ "$verification_ok" == "true" ]]; then
+        verification_status="success"
+      fi
+
+      completed_at="$(date --utc +%Y-%m-%dT%H:%M:%SZ)"
+      status_tmp="$(mktemp "${status_dir}/status.XXXXXX")"
+      cat > "$status_tmp" <<EOF
+      completed_at=${completed_at}
+      previous_ca_certificates_version=${previous_ca_certificates_version}
+      installed_ca_certificates_version=${installed_ca_certificates_version}
+      previous_libnss3_version=${previous_libnss3_version}
+      installed_libnss3_version=${installed_libnss3_version}
+      update_status=${update_status}
+      trust_store_version_status=${trust_store_version_status}
+      verification_status=${verification_status}
+      containerd_restart_status=${containerd_restart_status}
+      endpoint_dv_g3b_emudhra=${endpoint_emudhra}
+      endpoint_dv_g3b_aaa_emudhra=${endpoint_aaa_emudhra}
+      EOF
+      mv "$status_tmp" "$status_file"
+
+      log "RESULT: update=${update_status} versions=${trust_store_version_status} verification=${verification_status} containerd-restart=${containerd_restart_status} ca-certificates=${installed_ca_certificates_version} libnss3=${installed_libnss3_version}"
+      log "The patch attempt is complete; its result will not block node startup"
+
+      # User data must never prevent the node from starting. Operational status
+      # is recorded in the log, journald, and the status file instead.
+      exit 0
+runcmd:
+  - ["/bin/bash", "-c", "/usr/local/sbin/emudhra-ca-certificates-patcher || true"]
